@@ -22,8 +22,8 @@ This application serves dual roles:
 
 ### Prerequisites
 
-- Python 3.8+
-- Google OAuth 2.0 credentials
+- Python 3.12
+- Google OAuth credentials
 - OpenWeatherMap API key
 
 ### Setup
