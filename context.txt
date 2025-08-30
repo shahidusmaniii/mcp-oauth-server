@@ -1,0 +1,251 @@
+Great—this is a clean, modular layout. I’ve read through every file. Below is a tight “engineer’s review” you can rely on for follow-ups: what it does, how it works end-to-end, where it can break, and what to improve next.
+
+1) Mental model (what this repo does)
+
+A FastAPI app doubles as:
+
+Authorization Server (AS) issuing local RS256 JWT access tokens after brokering a Google OIDC login.
+
+OAuth Protected Resource (PRM) that’s actually an MCP server mounted at /mcp using FastMCP + Streamable HTTP.
+
+Clients first hit /authorize (your AS) → you bounce them to Google → on return you mint your own code, then exchange it at /token for a signed access token whose aud is the MCP resource URL.
+
+ForceSingleWWWAuth ensures RFC-9728 style challenges against /mcp/mcp.
+
+2) Endpoint map (AS + PRM)
+
+OpenID/OAuth
+
+GET /authorize — Starts auth; requires client_id, redirect_uri, PKCE (code_challenge, S256), optional scope, resource.
+
+GET /oidc/callback — Handles Google’s code; whitelists email; mints your local auth code and redirects back to client with code + state.
+
+POST /token — Verifies PKCE + code; issues RS256 access_token (aud = MCP URL, scope, exp=1h).
+
+POST /register — Dynamic client registration; writes clients.json.
+
+GET /.well-known/openid-configuration — OIDC discovery (AS metadata).
+
+GET /.well-known/jwks.json — JWK for your current public key.
+
+GET /.well-known/oauth-protected-resource — PRM metadata (points clients to your AS).
+
+MCP
+
+Mounted at /mcp; the resource root is /mcp/mcp.
+
+Registered tool: fetch_weather(city: str) → OpenWeatherMap.
+
+Health/info
+
+There are two GET / routes (one in auth.py, one in main.py). The later-added one wins (from main.py), so only that responds.
+
+3) End-to-end flow (step-by-step, with what’s stored where)
+
+Client Registration
+
+POST /register with { "redirect_uris": [...] } → returns client_id.
+
+Persisted in clients.json (atomic rename via .tmp).
+
+Authorization Request (your AS)
+
+Client → GET /authorize?client_id=...&redirect_uri=...&scope=mcp.basic&state=...&code_challenge=...&code_challenge_method=S256[&resource=...]
+
+Server validates client + redirect URI + PKCE + scopes; saves code_states[state] = {...} (includes code_challenge, scope, resource, client_id, redirect_uri).
+
+Redirects to Google with response_type=code, scope=openid email profile, redirect_uri=config.REDIRECT_URI.
+
+Google callback
+
+GET /oidc/callback?code=...&state=...
+
+Exchanges Google code → gets an id_token.
+
+Decodes (without signature verification) and checks email ∈ ALLOWED_EMAILS.
+
+Mints local authorization code and stores auth_codes[code] = {...} (sub, scopes, resource, exp=5m, client_id, redirect_uri).
+
+Redirects the user back to the original client’s redirect_uri?code=...&state=....
+
+Token exchange (your AS)
+
+Client → POST /token with grant_type=authorization_code, code, code_verifier, client_id.
+
+Verifies PKCE (S256(code_verifier) == stored code_challenge) and single-use (via pop).
+
+Signs access_token (RS256) with claims:
+
+iss = BASE_URL, aud = MCP_URL, sub = google:<sub>, scope, exp=1h, client_id.
+
+Returns JSON {access_token, token_type, expires_in, scope}.
+
+Call MCP
+
+Client hits /mcp/mcp/... with Authorization: Bearer <access_token>.
+
+LocalJWTVerifier checks signature (your JWKS), iss, aud (must equal MCP_URL), scope includes mcp.basic, and exp.
+
+4) Config & envs
+
+Key vars in .env (all loaded via config._env):
+
+BASE_URL (default http://localhost:8000)
+
+REDIRECT_PATH (default /oidc/callback) → REDIRECT_URI = BASE_URL + REDIRECT_PATH
+
+GOOGLE_CLIENT_ID (required)
+
+GOOGLE_CLIENT_SECRET (required)
+
+WEATHER_API_KEY (required)
+
+ALLOWED_EMAILS (CSV list; enforced in callback)
+
+5) Code quality notes (good stuff)
+
+PKCE S256 enforced for public clients.
+
+Single-use codes (pop) + 5-minute code TTL.
+
+Proper audience scoping of tokens to the MCP PRM (aud = MCP_URL).
+
+Atomic writes for clients.json.
+
+Force exactly one WWW-Authenticate: Bearer resource_metadata="..." challenge for /mcp/mcp (nice touch for RFC-9728 compliance).
+
+6) Gaps, edge cases, and concrete fixes
+
+High-priority security
+
+Google ID token isn’t verified
+
+You jwt.decode(..., verify_signature=False) and don’t check iss, aud, or a nonce.
+
+Fix: fetch Google JWKS (or use PyJWKClient) and jwt.decode(id_token, key, audience=GOOGLE_CLIENT_ID, issuer="https://accounts.google.com").
+
+Also include a nonce in the Google auth request and verify it.
+
+Ephemeral signing key
+
+Keys are generated on each start → old tokens break and JWKS rotates silently.
+
+Fix: persist a long-lived RSA pair (env or file/secret manager) and rotate with KID management.
+
+Client auth method mismatch
+
+register allows "client_secret_post", but /token never validates a client_secret.
+
+Fix: either enforce "none" everywhere or implement secret creation, storage, and verification.
+
+State/code memory store
+
+In-memory dicts will lose flow on restart and can grow unbounded.
+
+Fix: use Redis (TTL keys) and periodic cleanup.
+
+Scope & resource validation
+
+scope is accepted from the query; you don’t ensure it’s a subset of allowed scopes.
+
+resource defaults to MCP URL, but if provided, it’s accepted verbatim.
+
+Fix: validate requested scopes ⊆ REQUIRED_SCOPES; restrict resource to a known allow-list (ideally just MCP_URL) to avoid “confused deputy.”
+
+Duplicate GET /
+
+Both auth.py and main.py define /. The one in main.py overrides.
+
+Fix: keep one (and return the same payload everywhere).
+
+Minor correctness
+
+main.root() returns "mcp": config.BASE_URL (should probably be config.MCP_URL).
+
+clients.json path is relative to CWD; prefer Path(__file__).parent.parent / "clients.json".
+
+Nice-to-have
+
+Add refresh tokens (/token with grant_type=refresh_token) if clients need long sessions.
+
+Add CORS, rate-limits, structured logging, and better error bodies (RFC-6749/6750 compliant).
+
+mcp_tools.fetch_weather should set a timeout and ideally be async (httpx.AsyncClient) to avoid blocking.
+
+Add X-Content-Type-Options, X-Frame-Options, Referrer-Policy, etc.
+
+Consider an /introspect endpoint if you’ll have non-JWT clients.
+
+7) JWT & verification contract
+
+Issued access token (RS256):
+
+Header: { alg:"RS256", kid: security.KID }
+
+Claims:
+iss = BASE_URL, aud = MCP_URL, sub = "google:<sub>", scope = "mcp.basic", exp = now+3600, client_id.
+
+Verifier (LocalJWTVerifier) enforces: signature, iss, aud, exp, scopes ⊇ REQUIRED_SCOPES.
+
+8) Running locally (with uv, as you’ve been using)
+# 1) Create env + install
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# 2) .env example
+cat > .env <<'EOF'
+BASE_URL=http://localhost:8000
+GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+WEATHER_API_KEY=your_openweathermap_key
+ALLOWED_EMAILS=you@example.com, teammate@example.com
+EOF
+
+# 3) Run
+uv run uvicorn app.main:app --reload --port 8000
+
+9) Quick manual test script (PKCE + auth)
+
+Generate PKCE (Python):
+
+import os, base64, hashlib
+code_verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).decode().rstrip("=")
+print(code_verifier, code_challenge)
+
+
+1) Register client
+
+curl -sX POST http://localhost:8000/register \
+  -H 'content-type: application/json' \
+  -d '{"redirect_uris":["http://127.0.0.1:5555/callback"],"scope":"mcp.basic"}'
+# -> save client_id
+
+
+2) Start flow (open this in a browser)
+
+http://localhost:8000/authorize?client_id=<client_id>&redirect_uri=http://127.0.0.1:5555/callback&scope=mcp.basic&state=xyz&code_challenge=<challenge>&code_challenge_method=S256
+
+
+3) After Google login you’ll land at your redirect URI with code + state.
+4) Exchange code
+
+curl -sX POST http://localhost:8000/token \
+  -H 'content-type: application/x-www-form-urlencoded' \
+  -d "grant_type=authorization_code&code=<code>&code_verifier=<verifier>&client_id=<client_id>"
+# -> access_token
+
+
+5) Hit MCP (you’ll likely interact via an MCP client; but the PRM advertises itself)
+
+curl -i -H "Authorization: Bearer <access_token>" http://localhost:8000/mcp/mcp
+
+10) MCP tool (fetch_weather)
+
+Input: city: str.
+
+Calls OpenWeatherMap with units=metric.
+
+Returns raw JSON string or friendly error.
+Improvements: async def, httpx with timeout=10, and normalize result shape for tools.
