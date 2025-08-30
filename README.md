@@ -67,7 +67,7 @@ This application serves dual roles:
 
 ### MCP Server
 
-- `/mcp` - MCP server endpoint (requires Bearer token)
+- `/mcp/mcp` - MCP server endpoint (requires Bearer token)
 - Available tool: `fetch_weather(city: str)` - Get weather data for a city
 
 ## Usage Example
@@ -118,10 +118,10 @@ curl -H "Authorization: Bearer <access_token>" http://localhost:8000/mcp/mcp
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │
          │                       ▼
-         │              ┌──────────────────┐
-         └─────────────▶│   MCP Server     │
-                        │  (/mcp endpoint) │
-                        └──────────────────┘
+         │              ┌──────────────────────┐
+         └─────────────▶│   MCP Server         │
+                        │  (/mcp/mcp endpoint) │
+                        └──────────────────────┘
 ```
 
 ## Project Structure
